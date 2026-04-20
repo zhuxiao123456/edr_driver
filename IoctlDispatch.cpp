@@ -424,6 +424,7 @@ static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitS
 
 static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) {
     RtlZeroMemory(runtimeStatus, sizeof(DRIVER_RUNTIME_STATUS));
+    FILE_PROTECTION_RUNTIME_STATS fileProtectionStats = {};
 
     runtimeStatus->AbiVersion = PEBMONITOR_ABI_VERSION;
     runtimeStatus->StatusFlags = ReadInterlockedFlags((volatile LONG*)&g_RuntimeStatusFlags);
@@ -479,6 +480,15 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     runtimeStatus->CacheMissCount = ReadInterlockedCounter64(&g_DecisionCacheMissCount);
     runtimeStatus->CacheFlushCount = ReadInterlockedCounter64(&g_DecisionCacheFlushCount);
     runtimeStatus->SlowPathCount = ReadInterlockedCounter64(&g_SlowPathCount);
+
+    GetFileProtectionRuntimeStats(&fileProtectionStats);
+    runtimeStatus->FileProtectionBlockCount = fileProtectionStats.BlockCount;
+    runtimeStatus->FileProtectionCreateBlockCount = fileProtectionStats.CreateBlockCount;
+    runtimeStatus->FileProtectionSetInformationBlockCount = fileProtectionStats.SetInformationBlockCount;
+    RtlStringCchCopyW(
+        runtimeStatus->LastFileProtectionInfoClass,
+        RTL_NUMBER_OF(runtimeStatus->LastFileProtectionInfoClass),
+        fileProtectionStats.LastInfoClass);
 }
 
 VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

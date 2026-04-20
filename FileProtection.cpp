@@ -3,6 +3,12 @@
 static FILE_PROTECTION_STATE g_FileProtectionState = {};
 static const WCHAR g_ProtectedDriverOpenPathBuffer[] = L"\\SystemRoot\\System32\\drivers\\DriverModule.sys";
 static const WCHAR g_FileProtectionRuleId[] = L"driver_self_protection";
+static const WCHAR g_FileProtectionCreateInfoClassName[] = L"IRP_MJ_CREATE";
+static volatile LONG64 g_FileProtectionBlockCount = 0;
+static volatile LONG64 g_FileProtectionCreateBlockCount = 0;
+static volatile LONG64 g_FileProtectionSetInformationBlockCount = 0;
+static KSPIN_LOCK g_FileProtectionRuntimeStatsLock = {};
+static WCHAR g_LastFileProtectionInfoClass[MAX_RULE_LENGTH] = {};
 
 EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
@@ -80,6 +86,10 @@ static VOID CopyUnicodeStringToFixedBuffer(
     buffer[copyBytes / sizeof(WCHAR)] = L'\0';
 }
 
+static ULONG64 ReadInterlockedCounter64(_In_ volatile LONG64* value) {
+    return (ULONG64)InterlockedCompareExchange64(value, 0, 0);
+}
+
 static VOID InitializeUnicodeStringBuffer(
     _Out_ PUNICODE_STRING target,
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -120,6 +130,35 @@ static NTSTATUS CopyUnicodeStringToStateBuffer(
     buffer[copyBytes / sizeof(WCHAR)] = L'\0';
     target->Length = (USHORT)copyBytes;
     return STATUS_SUCCESS;
+}
+
+static VOID ResetFileProtectionRuntimeStats() {
+    InterlockedExchange64(&g_FileProtectionBlockCount, 0);
+    InterlockedExchange64(&g_FileProtectionCreateBlockCount, 0);
+    InterlockedExchange64(&g_FileProtectionSetInformationBlockCount, 0);
+    KeInitializeSpinLock(&g_FileProtectionRuntimeStatsLock);
+    RtlZeroMemory(g_LastFileProtectionInfoClass, sizeof(g_LastFileProtectionInfoClass));
+}
+
+static VOID RecordFileProtectionBlock(_In_opt_z_ PCWSTR infoClassName) {
+    PCWSTR effectiveInfoClassName = infoClassName;
+    if (effectiveInfoClassName == NULL || effectiveInfoClassName[0] == L'\0') {
+        effectiveInfoClassName = g_FileProtectionCreateInfoClassName;
+        InterlockedIncrement64(&g_FileProtectionCreateBlockCount);
+    }
+    else {
+        InterlockedIncrement64(&g_FileProtectionSetInformationBlockCount);
+    }
+
+    InterlockedIncrement64(&g_FileProtectionBlockCount);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_FileProtectionRuntimeStatsLock, &oldIrql);
+    CopyWideStringToFixedBuffer(
+        g_LastFileProtectionInfoClass,
+        RTL_NUMBER_OF(g_LastFileProtectionInfoClass),
+        effectiveInfoClassName);
+    KeReleaseSpinLock(&g_FileProtectionRuntimeStatsLock, oldIrql);
 }
 
 static BOOLEAN IsDangerousCreateRequest(_In_ PFLT_CALLBACK_DATA Data) {
@@ -227,6 +266,7 @@ static FLT_PREOP_CALLBACK_STATUS CompleteBlockedProtectedFileRequest(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCUNICODE_STRING normalizedName,
     _In_opt_z_ PCWSTR infoClassName) {
+    RecordFileProtectionBlock(infoClassName);
     QueueBlockedFileProtectionEvent(Data, normalizedName, infoClassName);
     Data->IoStatus.Status = STATUS_ACCESS_DENIED;
     Data->IoStatus.Information = 0;
@@ -303,6 +343,7 @@ static NTSTATUS ResolveCanonicalProtectedDriverPath() {
 
 NTSTATUS InitializeFileProtectionState() {
     RtlZeroMemory(&g_FileProtectionState, sizeof(g_FileProtectionState));
+    ResetFileProtectionRuntimeStats();
     RtlInitUnicodeString(
         &g_FileProtectionState.ProtectedDriverOpenPath,
         g_ProtectedDriverOpenPathBuffer);
@@ -325,7 +366,27 @@ NTSTATUS InitializeFileProtectionState() {
 }
 
 VOID CleanupFileProtectionState() {
+    ResetFileProtectionRuntimeStats();
     RtlZeroMemory(&g_FileProtectionState, sizeof(g_FileProtectionState));
+}
+
+VOID GetFileProtectionRuntimeStats(_Out_ PFILE_PROTECTION_RUNTIME_STATS runtimeStats) {
+    if (runtimeStats == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(runtimeStats, sizeof(*runtimeStats));
+    runtimeStats->BlockCount = ReadInterlockedCounter64(&g_FileProtectionBlockCount);
+    runtimeStats->CreateBlockCount = ReadInterlockedCounter64(&g_FileProtectionCreateBlockCount);
+    runtimeStats->SetInformationBlockCount = ReadInterlockedCounter64(&g_FileProtectionSetInformationBlockCount);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_FileProtectionRuntimeStatsLock, &oldIrql);
+    CopyWideStringToFixedBuffer(
+        runtimeStats->LastInfoClass,
+        RTL_NUMBER_OF(runtimeStats->LastInfoClass),
+        g_LastFileProtectionInfoClass);
+    KeReleaseSpinLock(&g_FileProtectionRuntimeStatsLock, oldIrql);
 }
 
 FLT_PREOP_CALLBACK_STATUS FileProtectionPreCreate(
